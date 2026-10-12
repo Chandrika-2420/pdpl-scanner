@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-UAE PDPL Website Scanner -> client-ready PDF report  (v1.3)
+UAE PDPL Website Scanner -> client-ready PDF report  (v1.4)
 Law   : Federal Decree-Law No. 45 of 2021 on the Protection of Personal Data (UAE PDPL)
 Run   : python pdpl_scanner.py           (asks for client details, then scans)
 Setup : pip install playwright   then   python -m playwright install chromium
@@ -19,6 +19,9 @@ v1.3  : the page is scrolled like a visitor (many sites load tags only on the fi
         notices are read; a plain "Cookie Policy" link is no longer mistaken for a banner; first-party Google tags,
         meta-tag CSP, report-only CSP and footer forms in embedded frames are handled; sites with no UAE link get
         a scope warning; evidence lines show the actual call or sentence.
+v1.4  : sites that skip their tags for automated browsers (tags set up in the code but never loaded) get a
+        "manual check needed" warning, consent is marked not assessed and the grade is capped, instead of a clean
+        pass; transfers described only for the EU/EEA are flagged; evidence quotes the exact sentence.
 Checks the presence of required wording and observable behaviour only. Not legal advice.
 """
 import argparse
@@ -411,6 +414,32 @@ PREFER = {"N-RECIPIENTS": re.compile(r"\b(share|shares|shared|sharing|disclose|d
           "N-PURPOSE": re.compile(r"\bpurposes?\b|how we use|الأغراض", re.I),
           "N-RETENTION": re.compile(r"\b(retain|retention|store)\b|الاحتفاظ", re.I),
           "N-BASIS": re.compile(r"legal basis|lawful basis|legitimate use|\bconsent\b|الأساس القانوني", re.I)}
+# Strong signs in the page code that a tracking tag is set up: (label, pattern, vendor names that prove it loaded)
+TAG_SIGNS = [
+    ("Google Tag Manager", r"\bGTM-[A-Z0-9]{4,10}\b", ("Google Tag Manager", "Google tag loader via the site's own server")),
+    ("Google tag (gtag)", r"gtag\(\s*['\"]config['\"]\s*,\s*['\"](?:G|AW|DC)-[A-Z0-9]+", ("Google Tag Manager", "Google Analytics", "Google Ads",
+                                                                           "Google tag loader via the site's own server", "Google Analytics via the site's own server")),
+    ("Meta Pixel", r"fbq\(\s*['\"]init['\"]", ("Meta Pixel", "Meta")),
+    ("LinkedIn Insight", r"_linkedin_partner_id", ("LinkedIn Insight",)),
+    ("Microsoft Clarity", r"clarity\.ms/tag/", ("Microsoft Clarity",)),
+    ("Hotjar", r"static\.hotjar\.com/c/hotjar-|_hjSettings", ("Hotjar",)),
+    ("TikTok Pixel", r"ttq\.load\(", ("TikTok Pixel",)),
+    ("Microsoft Ads UET", r"bat\.bing\.com/bat\.js|\buetq\b", ("Microsoft Ads UET",)),
+    ("X Pixel", r"\btwq\(\s*['\"](?:init|config)", ("X Pixel",))]
+TAG_SIGNS = [(lab, re.compile(p), names) for lab, p, names in TAG_SIGNS]
+
+
+def tags_in_code(page_html):
+    """Tracking tags set up in the page code (ignoring CSP and link tags, which only name allowed hosts)."""
+    code = re.sub(r"<meta\b[^>]*>|<link\b[^>]*>", " ", page_html or "", flags=re.I)
+    found = []
+    for lab, rxp, names in TAG_SIGNS:
+        m = rxp.search(code)
+        if m:
+            found.append((lab, m.group(0)[:40], names))
+    return found
+
+
 PD_RE = re.compile(r"personal (data|information)|your (data|information)|البيانات الشخصية", re.I)
 DATE_RE = re.compile(r"\b(19|20)\d{2}\b|\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b", re.I)
 
@@ -608,6 +637,17 @@ def find_best(r, lines):
 
 def ev_of(hit):
     return snip(hit[0], hit[1])
+
+
+def best_sentence(rxp, lines, extra=()):
+    """The sentence (not just the line) that matches rxp and every pattern in extra; returns (sentence, match) or None."""
+    cands = []
+    for ln in lines:
+        for sn in re.split(r"(?<=[.!?;])\s+", ln):
+            m = rxp.search(sn)
+            if m and all(x.search(sn) for x in extra):
+                cands.append((sn, m))
+    return max(cands, key=lambda c: (min(5, len(rxp.findall(c[0]))), min(len(c[0]), 300))) if cands else None
 
 
 async def jseval(pg, js, default=None, timeout=20):
@@ -1081,6 +1121,7 @@ class Scan:
         self.ptext, self.pbody, self.law_note = "", [], ""
         self.site = site_of(host_of(self.url))
         self.unassessed = {}                                   # category -> reason it could not be scored
+        self.hidden_tags = []
         self.parallel = auto_parallel(getattr(o, "parallel", None))
         self.timings = {}
 
@@ -1434,7 +1475,33 @@ class Scan:
         d["v_rej"] = vendors(d.get("reqs_b"), s, {"reject", "post"}) if d.get("rejected") else None
         if (d.get("status") or 0) >= 400:
             self.na.append("Homepage returned HTTP " + str(d["status"]) + "; results may reflect a block or error page")
+        # Tags set up in the code that never loaded in any session: the site hides them from automated browsers
+        seen = set(d["v_all"]) | set(d.get("v_rej") or {})
+        all_urls = " ".join(u for u, *_ in list(ra) + list(d.get("reqs_b") or []))
+        b = d.get("banner") or {}
+        hidden = []
+        if not (b.get("found") and not d.get("accepted")):
+            for lab, ev, names in tags_in_code(d["home"].get("html", "")):
+                tag_id = re.search(r"\b(?:GTM|G|AW|DC)-[A-Z0-9]+", ev)
+                if any(n in seen for n in names) or (tag_id and tag_id.group(0) in all_urls):
+                    continue                                   # it did load (a custom first-party loader still carries the ID)
+                hidden.append((lab, ev))
+        self.hidden_tags = hidden
+        if hidden:
+            ids = ", ".join(lab + " (" + ev + ")" for lab, ev in hidden[:6])
+            self.add("C-HIDDEN", "advisory", "info", "Tracking is set up on this site but did not load for the automated scanner: check manually",
+                     "advisory", "PDPL Art. 4; Art. 6", "Found in the page code but never requested: " + ids + ". Some sites skip their "
+                     "tags when they detect an automated browser, so the consent results may be incomplete.",
+                     "Open the site in a normal browser with developer tools (Network tab), scroll the page, and check which "
+                     "trackers load before any consent choice and after 'Reject'.")
         self._consent()
+        if hidden:
+            real = any(f.cat == "consent" and not f.passed and f.sev in ("critical", "high", "medium", "low") for f in self.res)
+            if not real:                                       # nothing observed: the clean result is not trustworthy, do not score it
+                self.unassessed["consent"] = "tracking is set up but did not load for an automated browser"
+                self.na.append("Consent and tracking behaviour (tracking tags are set up but did not load for the automated browser)")
+            else:                                              # real gaps were observed: keep them scored, flag that more may exist
+                self.na.append("Tags that did not load for the automated browser: " + ", ".join(lab for lab, _ in hidden[:4]))
         self._fingerprint()
         fi = self._forms()
         self._notice(fi)
@@ -1477,7 +1544,8 @@ class Scan:
                      "No tracking calls or cookies were seen, but each download still sends the visitor's IP address to the "
                      "vendor. Load these scripts only after consent.")
         else:
-            self.ok("C-PRECONSENT", "consent", "No analytics or advertising tracking before consent", "law", REF,
+            if not self.hidden_tags:
+                self.ok("C-PRECONSENT", "consent", "No analytics or advertising tracking before consent", "law", REF,
                     "No known non-essential third-party requests or tracking cookies before interaction.")
         unk = sorted({h for v in d["v_pre"].values() if v["cat"] == "unclassified" and v["mode"] == "tracking" for h in v["domains"]})
         if unk:
@@ -1494,8 +1562,9 @@ class Scan:
                          "Add a consent tool with Accept, Reject and Settings on the first screen, in English and "
                          "Arabic, and keep consent records (Art. 6(1)(a)).")
             else:
-                self.ok("C-BANNER", "consent", "No banner needed for what was observed", "law", "PDPL Art. 4",
-                        "No banner and no non-essential trackers." + note)
+                if not self.hidden_tags:
+                    self.ok("C-BANNER", "consent", "No banner needed for what was observed", "law", "PDPL Art. 4",
+                            "No banner and no non-essential trackers." + note)
             return
         kinds = {x["kind"] for x in b["buttons"]}
         btns = ", ".join('"' + x["text"] + '"' for x in b["buttons"][:8]) or "none found"
@@ -1780,8 +1849,8 @@ class Scan:
             if len(found) == len(rxs):
                 best = found[0]
                 if fid in PREFER:
-                    pref = [ln for ln in lines if PREFER[fid].search(ln) and (fid != "N-RECIPIENTS" or PD_RE.search(ln))]
-                    best = find_best(rxs[0], pref) or best
+                    extra = (PREFER[fid], PD_RE) if fid == "N-RECIPIENTS" else (PREFER[fid],)
+                    best = best_sentence(rxs[0], lines, extra) or best
                 self.ok(fid, cat, title, basis, ref, ev_of(best) + self.law_note)
                 continue
             if found:
@@ -1836,6 +1905,11 @@ class Scan:
         hit = find_best(chk[6][0], self.pbody) if self.pbody else None
         if "notice" in self.unassessed:
             self.na.append("Disclosure of transfers abroad in the privacy notice (notice could not be read)")
+        elif hit and not any(re.search(r"\bUAE\b|United Arab Emirates|الإمارات", ln) for ln in self.pbody if chk[6][0].search(ln)) and \
+                all(re.search(r"\bEEA\b|European Economic Area|\bEU\b|European Union|\bUK\b", ln) for ln in self.pbody if chk[6][0].search(ln)):
+            self.add("X-TRANSFER", "cross_border", "medium", "Transfers abroad are described only for the EU/EEA, not for the UAE", "law",
+                     chk[4], ev_of(hit), "Add the UAE view: which countries data goes to from the UAE and the safeguard used "
+                     "(a Data Office-approved country under Art. 22, or a contract / explicit consent under Art. 23).")
         elif hit:
             self.ok("X-TRANSFER", "cross_border", chk[5], "law", chk[4], ev_of(hit) + self.law_note)
         elif foreign:
@@ -2037,6 +2111,8 @@ class Scan:
             cap, cap_note = 79, "Grade capped at B because three or more high-severity gaps were found"
         elif "notice" in self.unassessed:
             cap, cap_note = 79, "Grade capped at B because the privacy notice could not be assessed"
+        elif "consent" in self.unassessed:
+            cap, cap_note = 79, "Grade capped at B because consent and tracking could not be assessed"
         score = min(raw, cap)
         cap_note = (cap_note + " (score before cap: " + str(raw) + ").") if score < raw else ""
         grade, meaning = next((g, m) for lim, g, m in GRADES if score >= lim)
@@ -2057,6 +2133,11 @@ class Scan:
                 "scope_warning": "" if self._uae_signals()[0] else (
                     "No link to the UAE was found on this website (no .ae domain, UAE address or phone number, AED prices "
                     "or UAE pages). Confirm that the UAE PDPL applies to this organisation before sharing this report."),
+                "assess_warning": "" if not self.hidden_tags else (
+                    "Tracking tags are set up on this website (" + ", ".join(lab for lab, _ in self.hidden_tags[:4]) + ") but did not "
+                    "load for the automated scanner. " + ("The consent and tracking results are not reliable: check them manually "
+                    "in a normal browser before sharing this report." if "consent" in self.unassessed else "The consent findings "
+                    "below are real, but more trackers may load for real visitors: check manually before sharing this report.")),
                 "policy_url": d.get("policy", {}).get("url"),
                 "policy_urls": d.get("policy", {}).get("urls"), "timings": self.timings, "parallel": self.parallel,
                 "not_covered": self.na + NOT_COVERED}
@@ -2117,6 +2198,7 @@ def render(r, c):
          "<div><div class='big'><div class='score'>" + str(r["score"]) + "<span class='muted' style='font-size:18px'>/100</span></div>",
          "<div class='gr' style='background:" + gc + "'>Grade " + r["grade"] + "</div><div class='muted'>" + e(r["meaning"]) + "</div></div>",
          cap, ("<p style='color:#b42318;font-weight:600'>" + e(r["scope_warning"]) + "</p>") if r.get("scope_warning") else "",
+         ("<p style='color:#b42318;font-weight:600'>" + e(r["assess_warning"]) + "</p>") if r.get("assess_warning") else "",
          "<p class='muted'>External website scan. Not a legal opinion or a guarantee of compliance.</p></div></section>",
          "<h2>Executive summary</h2><p>The scan found <b>" + str(n["critical"]) + " critical</b>, <b>" + str(n["high"]) + " high</b>, "
          + str(n["medium"]) + " medium and " + str(n["low"]) + " low-severity gaps on " + e(r["final_url"] or "") + ".</p>"]
@@ -2127,6 +2209,8 @@ def render(r, c):
                                                              for f in r["findings"][:6]) + "</ol>")
     if r.get("scope_warning"):
         p.append("<div class='note'><b>Scope.</b> " + e(r["scope_warning"]) + "</div>")
+    if r.get("assess_warning"):
+        p.append("<div class='note'><b>Manual check needed.</b> " + e(r["assess_warning"]) + "</div>")
     p.append("<div class='note'><b>Regulatory status.</b> " + e(STATUS_NOTE) + "</div><h2>Scores by area</h2>")
     for cat in r["cats"].values():
         if cat["score"] is None:
