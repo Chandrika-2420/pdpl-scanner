@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-UAE PDPL Website Scanner -> client-ready PDF report  (v1.2)
+UAE PDPL Website Scanner -> client-ready PDF report  (v1.3)
 Law   : Federal Decree-Law No. 45 of 2021 on the Protection of Personal Data (UAE PDPL)
 Run   : python pdpl_scanner.py           (asks for client details, then scans)
 Setup : pip install playwright   then   python -m playwright install chromium
@@ -14,6 +14,11 @@ v1.2  : fewer false positives: tags fired by the 'Accept' click are no longer co
         are no longer read as version numbers; no-notice results are not counted three times.
         Faster: smart waits instead of fixed sleeps, network checks run alongside the browser, images blocked
         on text-only pages, Accept and Reject sessions run side by side when the server has enough memory.
+v1.3  : the page is scrolled like a visitor (many sites load tags only on the first scroll); banners that close on
+        scroll are flagged; bot-protection pages stop the scan instead of producing a clean report; PDF privacy
+        notices are read; a plain "Cookie Policy" link is no longer mistaken for a banner; first-party Google tags,
+        meta-tag CSP, report-only CSP and footer forms in embedded frames are handled; sites with no UAE link get
+        a scope warning; evidence lines show the actual call or sentence.
 Checks the presence of required wording and observable behaviour only. Not legal advice.
 """
 import argparse
@@ -60,6 +65,7 @@ CHROME_ARGS = ["--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions
 # Run the Accept and Reject browser sessions side by side? "auto" = only when the server has 1.5 GB+ memory.
 # Override with the SCAN_PARALLEL environment variable (1 / 0 / auto) or --parallel on the command line.
 PARALLEL = os.environ.get("SCAN_PARALLEL", "auto")
+SESSION_LIMIT = int(os.environ.get("SCAN_SESSION_LIMIT", "240"))   # seconds; a browser session is stopped after this
 # ===============================================================================
 
 CATS = {"consent": ("Consent & tracking", 25), "notice": ("Privacy notice", 20),
@@ -109,6 +115,8 @@ analytics.tiktok.com|TikTok Pixel|advertising|SG
 snap.licdn.com|LinkedIn Insight|advertising|US
 px.ads.linkedin.com|LinkedIn Insight|advertising|US
 static.ads-twitter.com|X Pixel|advertising|US
+t.co|X Pixel|advertising|US
+hicloud.com|Huawei Dynamic Tag Manager|tag_manager|CN
 analytics.twitter.com|X Pixel|advertising|US
 sc-static.net|Snap Pixel|advertising|US
 tr.snapchat.com|Snap Pixel|advertising|US
@@ -313,7 +321,8 @@ UAE_REF_RE = rx(r"\bUAE PDPL\b|45 of 2021|decree[- ]law no\.? ?\(?45|uae (person
 FOREIGN_LAWS = [
     ("India's DPDP Act", r"\bDPDP\b|Digital Personal Data Protection|Data Protection Board of India|Data Fiduciar|Data Principal"
                          r"|Grievance Officer|Companies Act,? 2013|SPDI Rules|Information Technology Act"),
-    ("the EU/UK GDPR", r"\bGDPR\b|General Data Protection Regulation|\bEEA\b|Data Protection Act 2018"),
+    ("the EU GDPR", r"\bGDPR\b|General Data Protection Regulation|\bEEA\b|European Economic Area|EU standard contractual"),
+    ("the UK GDPR", r"\bUK GDPR\b|Data Protection Act 2018|Information Commissioner"),
     ("US state privacy laws", r"\bCCPA\b|\bCPRA\b|California Consumer Privacy"),
     ("Saudi Arabia's PDPL", r"\bSDAIA\b|Saudi Data (and|&) (AI|Artificial Intelligence) Authority")]
 PROBE = ["/privacy-policy", "/privacy", "/privacy-notice", "/legal/privacy", "/policies/privacy-policy",
@@ -345,7 +354,7 @@ CHECKS = [
      [r"we (may )?(share|disclose)|(share|shared|disclose|disclosed)[^.]{0,30}\bwith\b|third[- ]part(y|ies)|service providers?|recipients? of|الأطراف الثالثة|طرف ثالث|نشارك|مزودي الخدمات"],
      "Name the categories of recipients inside and outside the UAE. Required before processing (Art. 13(2))."),
     ("X-TRANSFER", "cross_border", "high", "law", "Art. 13(1)(g), 13(2); Art. 22-23", "Cross-border transfers and safeguards",
-     [r"outside (of )?(the )?(uae|u\.a\.e|united arab emirates|state|country)|international(ly)? transfer|cross[- ]border|transfer(red|s)?[^.]{0,80}(countr|jurisdiction|abroad)|contractual clauses|خارج الدولة|خارج (دولة )?الإمارات|عبر الحدود"],
+     [r"outside (of )?(the )?(uae|u\.a\.e|united arab emirates|state|country)|international(ly)? transfer|cross[- ]border|transfer(red|s)?[^.]{0,80}(countr|jurisdiction|abroad)|transfer(red|s|ring)?[^.]{0,60}\boutside\b|(located|stored|hosted|processe?d?)[^.]{0,30}\boutside (of )?(the )?[a-z]{3,}|contractual clauses|خارج الدولة|خارج (دولة )?الإمارات|عبر الحدود"],
      "State the destination countries and the safeguard used: a Data Office-approved country (Art. 22) or a contract / explicit consent (Art. 23)."),
     ("N-RETENTION", "notice", "medium", "law", "Art. 13(1)(e); Art. 5(7)", "Retention period or criteria",
      [r"\bretain|retention|how long|keep (your |the )?(personal )?(data|information)|(stored|kept) for|الاحتفاظ|مدة (التخزين|الحفظ)"],
@@ -369,8 +378,8 @@ CHECKS = [
      [r"sensitive (personal )?(data|information)|special categor|health (data|information)|biometric|البيانات (الشخصية )?الحساسة"],
      "Explain which sensitive data is processed, why, and the extra safeguards and consent applied."),
     ("R-ERASURE", "rights", "high", "law", "Art. 13(1)(f); Art. 15", "Correction and erasure rights",
-     [r"(correct|rectif|amend|update)[^.]{0,60}(data|information)|right (to|of) (correction|rectification)|تصحيح",
-      r"(delet|eras)[^.]{0,60}(data|information)|right (to|of) (erasure|deletion)|حذف|محو"],
+     [r"(correct|rectif|amend|update)[^.]{0,60}(data|information)|(data|information)[^.]{0,40}\b(corrected|rectified|amended|updated)\b|\brectification\b|right (to|of) (correction|rectification)|تصحيح",
+      r"(delet|eras)[^.]{0,60}(data|information)|(data|information)[^.]{0,40}\b(deleted|erased)\b|right (to|of) (erasure|deletion)|حذف|محو"],
      "Explain how to request correction and erasure, and when erasure applies (Art. 15)."),
     ("R-RESTRICT", "rights", "medium", "law", "Art. 16; Art. 17", "Restriction and objection rights",
      [r"restrict(ion)?[^.]{0,30}processing|\bobject(ion)?\b[^.]{0,30}processing|stop (the )?processing|تقييد|الاعتراض"],
@@ -396,11 +405,14 @@ CHECKS = [
 ]
 CHECKS = [(c[0], c[1], c[2], c[3], ("PDPL " + c[4]) if c[3] == "law" else c[4], c[5],
            [re.compile(p, re.I) for p in c[6]], c[7]) for c in CHECKS]
-FULL_SCOPE = {"N-UPDATED", "N-IDENTITY", "G-DPO", "N-COOKIES"}
+FULL_SCOPE = {"N-UPDATED", "N-IDENTITY", "G-DPO", "N-COOKIES"}   # may sit in short lines, so search all clean lines
 # When a check passes, quote a line that also contains these words if there is one (better evidence, same result)
 PREFER = {"N-RECIPIENTS": re.compile(r"\b(share|shares|shared|sharing|disclose|disclosed|disclosure|recipients?)\b|نشارك", re.I),
           "N-PURPOSE": re.compile(r"\bpurposes?\b|how we use|الأغراض", re.I),
-          "N-RETENTION": re.compile(r"\b(retain|retention|store)\b|الاحتفاظ", re.I)}   # may sit in short lines, so search all clean lines
+          "N-RETENTION": re.compile(r"\b(retain|retention|store)\b|الاحتفاظ", re.I),
+          "N-BASIS": re.compile(r"legal basis|lawful basis|legitimate use|\bconsent\b|الأساس القانوني", re.I)}
+PD_RE = re.compile(r"personal (data|information)|your (data|information)|البيانات الشخصية", re.I)
+DATE_RE = re.compile(r"\b(19|20)\d{2}\b|\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b", re.I)
 
 NOT_COVERED = ["Records of processing (Art. 7(4)) and processor contracts (Art. 8)",
                "Proof-of-consent records (Art. 6(1)(a))", "Breach-notification procedure (Art. 9)",
@@ -410,11 +422,14 @@ NOT_COVERED = ["Records of processing (Art. 7(4)) and processor contracts (Art. 
                "Pages behind logins, mobile apps, and email/SMS/WhatsApp marketing"]
 LIMITS = ["Clean browser sessions are captured before consent, after 'Accept' and after 'Reject'; every third-party "
           "request is matched to a vendor database with headquarters country. Requests caused by the 'Accept' or "
-          "'Reject' click itself are attributed to that choice, not to the pre-consent state.",
+          "'Reject' click itself are attributed to that choice, not to the pre-consent state. In each session the page is "
+          "scrolled and the mouse moved like a visitor reading it, because many sites load their tags only on the first "
+          "interaction; scrolling is not consent.",
           "A vendor counts as tracking when it makes data-sending calls or sets tracking cookies. A vendor whose "
           "script is only downloaded is shown as 'Script only'; Google Consent Mode calls marked as denied are shown "
           "separately. Cookies already set before 'Reject' are reported as left in place, not as new tracking.",
-          "Where the privacy link leads to a page listing several notices, the notices it links to are read together.",
+          "Where the privacy link leads to a page listing several notices, the notices it links to are read together. "
+          "Privacy notices published as PDF files are read as well.",
           "Privacy-notice checks read only the main policy text (menus, contents lists and definitions are ignored) "
           "and look for required wording in English and Arabic; they do not judge legal adequacy.",
           "Results reflect what the scanner's location was shown; banners can differ for UAE visitors.",
@@ -451,15 +466,32 @@ PAGE_JS = r"""() => { const LAYOUT = 'nav,header,footer,aside,[role="navigation"
 
 BANNER_JS = r"""() => {
  const KW = /(cookie|consent|gdpr|ملفات تعريف الارتباط|ملفات الارتباط|الكوكيز)/i;
- const SEL = '[id*="cookie" i],[class*="cookie" i],[id*="consent" i],[class*="consent" i],[id*="gdpr" i],[id*="onetrust" i],[id*="cybot" i],[id*="didomi" i],[id*="cmp" i],[class*="cmp-" i],[aria-label*="cookie" i],[role="dialog"],[role="alertdialog"],[aria-modal="true"]';
+ const SEL = '[id*="cookie" i],[class*="cookie" i],[id*="consent" i],[class*="consent" i],[id*="gdpr" i],[id*="onetrust" i],[id*="cybot" i],[id*="didomi" i],[id^="cmp" i],[id*="usercentrics" i],[aria-label*="cookie" i],[aria-label*="consent" i],[role="dialog"],[role="alertdialog"],[aria-modal="true"]';
+ const KNOWN = '#onetrust-banner-sdk,#onetrust-consent-sdk,#CybotCookiebotDialog,#usercentrics-root,.cky-consent-container,#didomi-host,#cmpbox,#cmpwrapper,.cmplz-cookiebanner,.osano-cm-window,#truste-consent-track,#cookie-law-info-bar,.cc-window,#iubenda-cs-banner,#termly-code-snippet-support';
+ const STOP = new Set(['BODY', 'HTML', 'MAIN', 'HEADER', 'FOOTER', 'NAV', 'ARTICLE', 'ASIDE']);
  const roots = [document]; const walk = r => { for (const el of r.querySelectorAll('*')) if (el.shadowRoot) { roots.push(el.shadowRoot); walk(el.shadowRoot); } };
  try { walk(document); } catch (e) {}
  const vis = el => { const b = el.getBoundingClientRect(), s = getComputedStyle(el); return b.width > 0 && b.height > 0 && s.visibility !== 'hidden' && s.display !== 'none' && parseFloat(s.opacity || '1') > 0.05; };
- const boxes = []; for (const r of roots) for (const el of r.querySelectorAll(SEL)) { if (!vis(el)) continue; const t = (el.innerText || '').trim(); if (t && t.length < 6000 && KW.test(t)) boxes.push(el); }
+ const ACT = /accept|agree|allow|reject|decline|deny|refuse|ok\b|got it|settings|preferences|manage|customi[sz]e|necessary|essential|continue without|قبول|رفض|موافق|أوافق|الإعدادات/i;
+ const isCtrl = b => vis(b) && (b.tagName !== 'A' || ACT.test(b.innerText || b.getAttribute('aria-label') || ''));
+ const ctrls = el => [...el.querySelectorAll('button,[role="button"],a,input[type="button"],input[type="submit"]')].filter(isCtrl).length;
+ const floating = el => { for (let e = el, k = 0; e && k < 5 && !STOP.has(e.tagName); e = e.parentElement, k++) { const s = getComputedStyle(e);
+   if (s.position === 'fixed' || s.position === 'sticky' || e.getAttribute('role') === 'dialog' || e.getAttribute('aria-modal') === 'true') return true; } return false; };
+ const inView = el => { const b = el.getBoundingClientRect(); return b.top < innerHeight && b.bottom > 0; };
+ const boxes = []; for (const r of roots) for (const el of r.querySelectorAll(SEL)) { if (!vis(el)) continue; const t = (el.innerText || '').trim();
+  if (!t || t.length < 30 || t.length > 6000 || !KW.test(t)) continue;           // a short "Cookie Policy" link is not a banner
+  const byAttr = el.matches('[id*="cookie" i],[class*="cookie" i],[id*="consent" i],[class*="consent" i],[id*="gdpr" i],[id*="onetrust" i],[id*="cybot" i],[id*="didomi" i],[id^="cmp" i],[id*="usercentrics" i],[aria-label*="cookie" i],[aria-label*="consent" i]') || el.closest(KNOWN);
+  if (!byAttr && !/cookie|ملفات تعريف الارتباط|ملفات الارتباط|الكوكيز/i.test(t)) continue;   // e.g. a newsletter pop-up
+  if (STOP.has(el.tagName)) continue;
+  let box = el; for (let k = 0; k < 3 && box && !ctrls(box); k++) { const p = box.parentElement; box = (p && !STOP.has(p.tagName) && (p.innerText || '').length < 3000) ? p : null; }
+  if (!box || !ctrls(box) || boxes.includes(box)) continue;
+  // a banner floats over the page, is a known consent tool, or sits in view with consent buttons - not a footer note
+  if (!(box.matches(KNOWN) || box.closest(KNOWN) || floating(box) || (inView(box) && /accept|agree|allow|consent|قبول|موافق/i.test(box.innerText || '')))) continue;
+  boxes.push(box); }
  const seen = new Set(), buttons = [], pre = []; let text = '', i = 0;
  for (const c of boxes) { const t = (c.innerText || '').trim(); if (t.length > text.length) text = t;
   for (const b of c.querySelectorAll('button,[role="button"],a,input[type="button"],input[type="submit"]')) {
-   if (seen.has(b) || !vis(b)) continue; seen.add(b);
+   if (seen.has(b) || !vis(b) || (b.tagName === 'A' && !isCtrl(b) && !/cookie|privacy|policy/i.test(b.innerText || ''))) continue; seen.add(b);
    const lab = String(b.innerText || b.value || b.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ');
    if (!lab || lab.length > 80) continue; b.setAttribute('data-pdpl-btn', String(i)); buttons.push({ idx: i, text: lab }); i++; }
   for (const x of c.querySelectorAll('input[type="checkbox"],[role="switch"],[role="checkbox"]')) {
@@ -472,8 +504,18 @@ BANNER_JS = r"""() => {
 
 WITHDRAW_JS = r"""() => { const RX = /(cookies? (settings|preferences|choices)|manage (cookies|consent|preferences)|privacy (settings|choices|preferences)|consent (settings|preferences)|your privacy choices|إعدادات (ملفات تعريف الارتباط|الخصوصية|الكوكيز))/i;
  for (const el of document.querySelectorAll('a,button,[role="button"]')) { const t = (el.innerText || el.getAttribute('aria-label') || '').trim(); if (t && t.length < 80 && RX.test(t)) return t; }
- const w = document.querySelector('#ot-sdk-btn-floating,#ot-sdk-btn,.ot-sdk-show-settings,#CookiebotWidget,.cky-btn-revisit-wrapper,.osano-cm-widget,.cmplz-manage-consent,#usercentrics-root,a[href*="Cookiebot.renew"]');
+ const w = document.querySelector('#ot-sdk-btn-floating,#ot-sdk-btn,.ot-sdk-show-settings,#CookiebotWidget,.cky-btn-revisit-wrapper,.osano-cm-widget,.cmplz-manage-consent,#usercentrics-root,a[href*="Cookiebot.renew"],.cc-revoke,#cookie-law-info-again,.iubenda-tp-btn,#termly-code-snippet-support,[id*="cookie-settings" i],[class*="cookie-settings" i],[class*="consent-settings" i]');
  return w ? ('widget: ' + (w.id || String(w.className) || w.tagName)) : null; }"""
+
+# On the cookie policy page only real controls count (buttons, script links), not links to browser help pages
+WITHDRAW_BTN_JS = r"""() => { const RX = /(cookie|consent|privacy) (settings|preferences|choices)|manage (cookies|consent|preferences)|change (your )?(cookie )?(settings|preferences|consent)|withdraw (my )?consent|إعدادات/i;
+ for (const el of document.querySelectorAll('button,[role="button"],a[href^="#"],a[href^="javascript"],a[onclick]')) { const t = (el.innerText || el.getAttribute('aria-label') || '').trim(); if (t && t.length < 80 && RX.test(t)) return t; }
+ return null; }"""
+WIDGET_JS = r"""() => { const w = document.querySelector('#ot-sdk-btn-floating,#ot-sdk-btn,.ot-sdk-show-settings,#CookiebotWidget,.cky-btn-revisit-wrapper,.osano-cm-widget,.cmplz-manage-consent,a[href*="Cookiebot.renew"],.cc-revoke,#cookie-law-info-again,.iubenda-tp-btn,#termly-code-snippet-support');
+ return w ? ('widget: ' + (w.id || String(w.className) || w.tagName)) : null; }"""
+PLINK_JS = r"""() => [...document.querySelectorAll('a[href]')].some(a => /privacy|data-protection|الخصوصية|حماية البيانات/i.test((a.innerText || '') + ' ' + (a.getAttribute('href') || '')))"""
+SGTM_LOADER_RE = re.compile(r"/(gtm\.js|gtag/js)$", re.I)          # Google tag loaders served from the site's own domain
+SGTM_HIT_RE = re.compile(r"(^|/)(g|j|mp)/collect$", re.I)            # Google Analytics hits via server-side tagging
 
 FORMS_JS = r"""() => { const SKIP = new Set(['hidden', 'submit', 'button', 'reset', 'image']);
  const plink = [...document.querySelectorAll('a[href]')].some(a => /privacy|data-protection|الخصوصية|حماية البيانات/i.test((a.innerText || '') + ' ' + (a.getAttribute('href') || '')));
@@ -568,9 +610,9 @@ def ev_of(hit):
     return snip(hit[0], hit[1])
 
 
-async def jseval(pg, js, default=None):
+async def jseval(pg, js, default=None, timeout=20):
     try:
-        return await pg.evaluate(js)
+        return await asyncio.wait_for(pg.evaluate(js), timeout)
     except Exception:
         return default
 
@@ -579,7 +621,7 @@ async def frames_eval(pg, js):
     out = []
     for fr in list(pg.frames):
         try:
-            r = await fr.evaluate(js)
+            r = await asyncio.wait_for(fr.evaluate(js), 15)
             if isinstance(r, list):
                 out += r
         except Exception:
@@ -604,6 +646,31 @@ async def settle_net(pg, net, min_ms, quiet_ms=1500, max_ms=None):
         if (now - t_load) * 1000 >= min_ms and (now - net["last3p"]) * 1000 >= quiet_ms:
             break
         await asyncio.sleep(0.25)
+
+
+INTERACT_JS = r"""() => { for (const t of ['touchstart', 'scroll', 'mousemove']) { try { window.dispatchEvent(new Event(t)); document.dispatchEvent(new Event(t)); } catch (e) {} } }"""
+
+
+async def interact(pg, net, min_ms):
+    """Move the mouse and scroll like a visitor reading the page, then wait for third-party requests to settle.
+    Many sites load their tag manager only on the first scroll or mouse move. Scrolling is not consent, so
+    anything that loads now still counts as 'before consent'."""
+    async def gestures():
+        for x, y in ((320, 300), (700, 460), (980, 260)):
+            await pg.mouse.move(x, y, steps=5)
+        await pg.mouse.wheel(0, 700)
+        await asyncio.sleep(0.35)
+        await pg.mouse.wheel(0, 700)
+        await asyncio.sleep(0.35)
+    try:
+        await asyncio.wait_for(gestures(), 15)
+        await jseval(pg, INTERACT_JS)
+        await jseval(pg, "() => window.scrollTo(0, Math.max(document.body ? document.body.scrollHeight : 0, 2000))")
+        await asyncio.sleep(0.6)
+        await jseval(pg, "() => window.scrollTo(0, 0)")
+    except Exception:
+        pass
+    await settle_net(pg, net, max(1500, min_ms - 1000), max_ms=min_ms + 5000)
 
 
 async def settle_dom(pg, min_ms=700, max_ms=4500):
@@ -636,7 +703,7 @@ async def detect_banner(pg):
     frames, res = list(pg.frames), {"found": False, "text": "", "buttons": [], "pre": [], "cmp": ""}
     for i, fr in enumerate(frames):
         try:
-            r = await fr.evaluate(BANNER_JS)
+            r = await asyncio.wait_for(fr.evaluate(BANNER_JS), 15)
         except Exception:
             continue
         if not r:
@@ -786,9 +853,18 @@ def vendors(reqs, site, phases):
     for item in reqs or []:
         url, ph, rtype = (item + ("other",))[:3] if len(item) == 2 else item
         h = host_of(url)
-        if ph not in phases or not url.startswith("http") or not h or site_of(h) == site:
+        if ph not in phases or not url.startswith("http") or not h:
             continue
-        name, cat, cc = classify(url) or (site_of(h), "unclassified", "??")
+        if site_of(h) == site:
+            pu = urlparse(url)
+            if SGTM_HIT_RE.search(pu.path or "") and re.search(r"(^|&)(tid|en|v)=", pu.query or ""):
+                name, cat, cc = "Google Analytics via the site's own server", "analytics", "??"
+            elif SGTM_LOADER_RE.search(pu.path or "") and re.search(r"(^|&)id=(GTM|G|AW|DC)-", pu.query or "", re.I):
+                name, cat, cc = "Google tag loader via the site's own server", "tag_manager", "??"
+            else:
+                continue
+        else:
+            name, cat, cc = classify(url) or (site_of(h), "unclassified", "??")
         v = out.setdefault(name, {"vendor": name, "cat": cat, "cc": cc, "domains": set(), "hits": 0, "denied": 0, "libs": 0,
                                   "samples": []})
         v["domains"].add(h)
@@ -1047,7 +1123,8 @@ class Scan:
             await pg.reload(wait_until="domcontentloaded", timeout=self.o.timeout)
         except Exception:
             pass
-        await settle_net(pg, net, self._min_wait())
+        await settle_net(pg, net, 1500)
+        await interact(pg, net, self._min_wait())
 
     def collect(self):
         t0 = time.monotonic()
@@ -1074,27 +1151,53 @@ class Scan:
             launch["proxy"] = {"server": p.scheme + "://" + str(p.hostname) + (":" + str(p.port) if p.port else "")}
             if p.username:
                 launch["proxy"].update(username=p.username, password=p.password or "")
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda lp, c: None if "TargetClosed" in repr(c.get("exception")) else lp.default_exception_handler(c))
         async with async_playwright() as pw:
             b = await pw.chromium.launch(**launch)
             try:
                 if self.parallel and not o.no_reject:
-                    ra, rb = await asyncio.gather(self._session_a(b), self._session_b(b), return_exceptions=True)
+                    ra, rb = await asyncio.gather(self._limited(self._session_a(b), "a"), self._limited(self._session_b(b), "b"),
+                                                  return_exceptions=True)
                     if isinstance(ra, BaseException):
                         raise ra
                     if not d["banner"]["found"]:                   # session B clicked nothing: discard it
                         d["rejected"] = None
                 else:
-                    await self._session_a(b)
+                    await self._limited(self._session_a(b), "a")
                     if d["banner"]["found"] and not o.no_reject:
-                        await self._session_b(b)
+                        try:
+                            await self._limited(self._session_b(b), "b")
+                        except Exception:
+                            d["rejected"] = None
             finally:
                 await b.close()
+
+    async def _limited(self, coro, which):
+        """Hard time limit per browser session, so one hung page cannot block the scan queue."""
+        try:
+            return await asyncio.wait_for(coro, SESSION_LIMIT)
+        except asyncio.TimeoutError:
+            if which == "a":
+                raise RuntimeError("The website took too long to respond (over " + str(SESSION_LIMIT) + " seconds), so no "
+                                   "report was made. Try again later.")
+            self.d["rejected"] = None
+            self.na.append("What happens after 'Reject' (the second browser session timed out)")
 
     async def _session_a(self, b):                   # clean visit -> Accept -> reload -> notice + form pages
         o, d = self.o, self.d
         t0 = time.monotonic()
         ctx, net = await self._ctx(b)
         pg = await ctx.new_page()
+        last_doc = {}
+
+        def on_response(r):
+            try:
+                if r.request.is_navigation_request() and r.frame == pg.main_frame:
+                    last_doc["resp"] = r
+            except Exception:
+                pass
+        pg.on("response", on_response)
         try:
             resp = await pg.goto(self.url, wait_until="domcontentloaded", timeout=o.timeout)
         except Exception as ex:
@@ -1104,17 +1207,31 @@ class Scan:
         fh = host_of(pg.url)
         if fh not in self._net_futs:                     # redirected (e.g. to www.): start that host's checks now
             self._net_futs[fh] = self._net_ex.submit(net_checks, fh, pg.url)
-        await settle_net(pg, net, self._min_wait())
-        d["final"], d["status"] = pg.url, (resp.status if resp else None)
+        await settle_net(pg, net, 1500)
+        st = resp.status if (resp and pg.url.split("#")[0] == resp.url.split("#")[0]) else 200   # a JS redirect moved on
+        title = await jseval(pg, "() => document.title || ''") or ""
+        words = len((await jseval(pg, "() => document.body ? document.body.innerText : ''") or "").split())
+        if (st in (401, 403, 429, 503) and (BLOCKED_RE.search(title) or words < 150)) or (BLOCKED_RE.search(title) and words < 150):
+            await ctx.close()
+            raise RuntimeError("The website blocked the automated browser (HTTP " + str(st) + ", bot-protection page), so no "
+                               "report was made. Try again later, or set SCAN_PROXY to a UAE proxy.")
+        final_resp = last_doc.get("resp") or resp                # the page as it is now, after any JavaScript redirect
+        d["final"], d["status"] = pg.url, (final_resp.status if final_resp else None)
         self.site = site_of(host_of(pg.url))
         try:
-            d["headers"] = {k.lower(): v for k, v in (await resp.all_headers()).items()} if resp else {}
+            d["headers"] = {k.lower(): v for k, v in (await final_resp.all_headers()).items()} if final_resp else {}
         except Exception:
             d["headers"] = {}
-        d["home"] = await jseval(pg, PAGE_JS) or EMPTY
-        d["forms"] = [dict(f, page=pg.url) for f in await frames_eval(pg, FORMS_JS)]
+        banner0, _ = await wait_banner(pg)
+        await interact(pg, net, self._min_wait())           # loads tags that wait for the first scroll / mouse move
+        d["home"] = await jseval(pg, PAGE_JS) or EMPTY       # read after scrolling, so lazy footers and links are included
+        banner, frames = await detect_banner(pg)
+        if banner0["found"] and not banner["found"]:
+            d["banner_scrolled_away"] = True                 # the banner closed itself when the visitor scrolled
+            banner = banner0
+        mp = bool(await jseval(pg, PLINK_JS))
+        d["forms"] = [dict(f, page=pg.url, plink=f.get("plink") or mp) for f in await frames_eval(pg, FORMS_JS)]
         d["fp"] = await frames_eval(pg, "() => window.__fp || []")
-        banner, frames = await wait_banner(pg)
         d["banner"], d["ck_pre"], d["accepted"] = banner, await ctx.cookies(), None
         if banner["found"]:
             i0 = len(net["reqs"])
@@ -1125,6 +1242,18 @@ class Scan:
                 net["phase"] = "post"
                 await self._reload(pg, net)
                 d["ck_acc"], d["withdraw"] = await ctx.cookies(), await jseval(pg, WITHDRAW_JS)
+                if not d["withdraw"]:                        # look for a settings button on the cookie policy page
+                    cps = [l["href"] for l in d["home"]["links"] if re.search(r"cookie", l["text"] + " " + l["href"], re.I)
+                           and site_of(host_of(l["href"])) == self.site]
+                    if cps:
+                        try:
+                            await pg.goto(cps[0], wait_until="domcontentloaded", timeout=min(o.timeout, 20000))
+                            await settle_dom(pg)
+                            found = await jseval(pg, WITHDRAW_BTN_JS) or await jseval(pg, WIDGET_JS)
+                            if found:
+                                d["withdraw"], d["withdraw_where"] = found, cps[0]
+                        except Exception:
+                            pass
             else:                                            # nothing was clicked: those requests are still pre-consent
                 net["reqs"][i0:] = [(u, "pre", t) for u, _, t in net["reqs"][i0:]]
                 net["phase"] = "pre"
@@ -1150,8 +1279,10 @@ class Scan:
         try:
             pg = await ctx.new_page()
             await pg.goto(self.url, wait_until="domcontentloaded", timeout=self.o.timeout)
-            await settle_net(pg, net, self._min_wait())
-            banner, frames = await wait_banner(pg)
+            await settle_net(pg, net, 1500)
+            await wait_banner(pg)
+            await interact(pg, net, self._min_wait())
+            banner, frames = await detect_banner(pg)
             if banner["found"]:
                 net["phase"] = "reject"
                 d["rejected"] = await click_banner(pg, frames, banner, "reject")
@@ -1167,11 +1298,35 @@ class Scan:
             await ctx.close()
             self.timings["consent_b"] = round(time.monotonic() - t0, 1)
 
+    async def _pdf_text(self, ctx, url):
+        """Privacy notices published as PDF files: download and extract the text."""
+        try:
+            r = await ctx.request.get(url, timeout=20000)
+            body = await r.body()
+            if not r.ok or b"%PDF" not in body[:1024]:
+                return None, "unreadable (PDF link did not return a PDF)"
+            import io
+            from pypdf import PdfReader
+            raw = "\n".join((pg_.extract_text() or "") for pg_ in PdfReader(io.BytesIO(body)).pages[:40])
+            text = "\n".join(re.split(r"(?<=[.!?])\s+", re.sub(r"\s*\n\s*", " ", raw)))   # one sentence per line
+            if len(text.split()) < 50:
+                return None, "unreadable (privacy notice is a PDF without a text layer, e.g. a scan)"
+            return {"url": url, "title": "", "lang": "", "main": text, "text": text, "links": [], "mlinks": [], "alts": [],
+                    "langs": [], "html": "", "pdf": True}, ""
+        except ImportError:
+            return None, "unreadable (privacy notice is a PDF and pypdf is not installed)"
+        except Exception:
+            return None, "unreadable (privacy notice is a PDF that could not be read)"
+
     async def _open_text_page(self, pg, url):
         """Load a page for its text only. Returns (info, status-note)."""
+        if urlparse(url).path.lower().endswith(".pdf"):
+            return await self._pdf_text(pg.context, url)
         try:
             r = await pg.goto(url, wait_until="domcontentloaded", timeout=min(self.o.timeout, 20000))
         except Exception as ex:
+            if "download" in str(ex).lower():
+                return await self._pdf_text(pg.context, url)
             return None, "could not load (" + (str(ex).splitlines() or ["error"])[0][:60] + ")"
         status = r.status if r else 0
         if status in (401, 403, 429) or status >= 500:
@@ -1181,7 +1336,7 @@ class Scan:
         await settle_dom(pg)
         info = await jseval(pg, PAGE_JS) or EMPTY
         if len((info.get("main") or "").split()) < 150:          # text may still be loading (embedded notice tools)
-            await settle_dom(pg, 1500, 4000)
+            await settle_dom(pg, 1200, 3000)
             info = await jseval(pg, PAGE_JS) or info
         if BLOCKED_RE.search(info.get("title", "")) and len((info.get("main") or "").split()) < 150:
             return None, "blocked (bot check page)"
@@ -1238,7 +1393,8 @@ class Scan:
         finally:
             await pg.close()
         return {"found": False, "linked": bool(linked), "tried": sorted(tried)[:8],
-                "blocked": [n for h, n in notes if h in ("link", "hub-link") and "blocked" in n], "notes": [n for _, n in notes]}
+                "blocked": [n for h, n in notes if h in ("link", "hub-link") and ("blocked" in n or "unreadable" in n)],
+                "notes": [n for _, n in notes]}
 
     async def _crawl(self, ctx):
         d, todo = self.d, []
@@ -1255,7 +1411,14 @@ class Scan:
                 try:
                     await pg.goto(u, wait_until="domcontentloaded", timeout=min(self.o.timeout, 20000))
                     await settle_dom(pg, 900, 5000)
-                    d["forms"] += [dict(f, page=pg.url) for f in await frames_eval(pg, FORMS_JS)]
+                    found = await frames_eval(pg, FORMS_JS)
+                    pii_found = any((fi_ := form_info(dict(f, page=pg.url))) and (fi_["pii"] or fi_["sens"]) for f in found)
+                    if not pii_found:                        # forms lower down the page may load only when scrolled to
+                        await jseval(pg, "() => window.scrollTo(0, document.body ? document.body.scrollHeight : 0)")
+                        await settle_dom(pg, 600, 2500)
+                        found = await frames_eval(pg, FORMS_JS)
+                    mp = bool(await jseval(pg, PLINK_JS))
+                    d["forms"] += [dict(f, page=pg.url, plink=f.get("plink") or mp) for f in found]
                 except Exception:
                     pass
         finally:
@@ -1346,6 +1509,10 @@ class Scan:
         else:
             self.add("C-REJECT", "consent", "high", "Banner gives no way to refuse", "law", VALID, "Buttons: " + btns,
                      "Add 'Reject all' next to 'Accept all'; an accept-only banner is not a real choice.")
+        if d.get("banner_scrolled_away"):
+            self.add("C-SCROLL", "consent", "high", "Banner closes itself when the visitor scrolls", "law", VALID,
+                     "The consent banner was visible on arrival and disappeared after the page was scrolled, without any "
+                     "button being clicked.", "Keep the banner until the visitor makes a choice; scrolling is not consent.")
         m = IMPLIED_RE.search(b["text"])
         if m:
             self.add("C-IMPLIED", "consent", "high", "Banner relies on implied consent (continued browsing)", "law", VALID,
@@ -1356,7 +1523,8 @@ class Scan:
         W = "PDPL Art. 6(1)(c), 6(2)"
         if d.get("accepted"):
             if d.get("withdraw"):
-                self.ok("C-WITHDRAW", "consent", "Permanent link to change or withdraw consent", "law", W, "Found: " + str(d["withdraw"]))
+                self.ok("C-WITHDRAW", "consent", "Permanent link to change or withdraw consent", "law", W, "Found: " + str(d["withdraw"]) +
+                        (" (on the cookie policy page " + d["withdraw_where"] + ", not on the homepage)" if d.get("withdraw_where") else ""))
             else:
                 self.add("C-WITHDRAW", "consent", "medium", "No visible way to withdraw consent after accepting", "law", W,
                          "After accepting, no 'Cookie settings' link or consent widget was found.",
@@ -1478,7 +1646,7 @@ class Scan:
                 insecure.append(f["page"])
         REF = "PDPL Art. 13(2) (purposes, recipients and transfer safeguards before processing); Art. 5(1)"
         if miss_s:
-            self.add("F-NOTICE-SENSITIVE", "collection", "critical", "Sensitive data collected with no privacy notice on the form",
+            self.add("F-NOTICE-SENSITIVE", "collection", "high" if all("general privacy link" in m for m in miss_s) else "critical", "Sensitive data collected with no privacy notice on the form",
                      "law", REF + "; Art. 1 (Sensitive Personal Data)", " | ".join(miss_s[:5]),
                      "Add a short notice and privacy-notice link next to the submit button, and get explicit consent.")
         if miss:
@@ -1556,6 +1724,13 @@ class Scan:
         uae = UAE_REF_RE.search(full) or (re.search(r"\bPDPL\b", full) and re.search(r"\bUAE\b|United Arab Emirates|الإمارات", full))
         if uae:
             self.ok("N-PDPL", "notice", "UAE PDPL referenced", "best", "Best practice (localisation)", snip(full, uae))
+        elif laws and not self._uae_signals()[0]:
+            names = " and ".join(n for n, _ in laws)
+            self.add("N-JURISDICTION", "advisory", "info", "Privacy notice is written for " + names + " (no link to the UAE found)",
+                     "advisory", "PDPL Art. 2(1); Art. 13", "The notice refers to " + ", ".join(n + " (" + str(k) + " mentions)" for n, k in laws) +
+                     ". No sign was found that the organisation serves people in the UAE.",
+                     "If the organisation serves people in the UAE, add a UAE section under Federal Decree-Law No. 45 of 2021.")
+            self.law_note = " [Note: written for " + names + "; confirm this wording also meets the PDPL.]"
         elif laws:
             names = " and ".join(n for n, _ in laws)
             self.add("N-JURISDICTION", "notice", "high" if max(k for _, k in laws) >= 3 else "medium",
@@ -1589,10 +1764,23 @@ class Scan:
                     self.add(fid, "advisory", "info", "No Data Protection Officer named", "advisory", ref,
                              "The privacy notice does not name a DPO.", fix)
                 continue
+            if len(found) == len(rxs) and fid == "N-UPDATED":
+                ev = ev_of(found[0])
+                for i, ln in enumerate(lines):                 # quote the line that carries the actual date
+                    if rxs[0].search(ln):
+                        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+                        if DATE_RE.search(ln) and len(ln) < 200:
+                            ev = ln
+                            break
+                        if len(ln) < 60 and DATE_RE.search(nxt) and len(nxt) < 60:
+                            ev = ln + " " + nxt
+                            break
+                self.ok(fid, cat, title, basis, ref, ev + self.law_note)
+                continue
             if len(found) == len(rxs):
                 best = found[0]
                 if fid in PREFER:
-                    pref = [ln for ln in lines if PREFER[fid].search(ln)]
+                    pref = [ln for ln in lines if PREFER[fid].search(ln) and (fid != "N-RECIPIENTS" or PD_RE.search(ln))]
                     best = find_best(rxs[0], pref) or best
                 self.ok(fid, cat, title, basis, ref, ev_of(best) + self.law_note)
                 continue
@@ -1701,9 +1889,22 @@ class Scan:
         elif https:
             self.ok("S-HSTS", "security", "HSTS enabled", "law", R, hsts)
         csp = h.get("content-security-policy", "")
+        if not csp:                                        # a CSP can also be set with <meta http-equiv>
+            for tag in re.findall(r"<meta\b[^>]*>", d["home"].get("html", ""), re.I):
+                if re.search(r"http-equiv\s*=\s*[\"']?content-security-policy[\"'\s>]", tag, re.I):
+                    mc = re.search(r"content\s*=\s*([\"'])(.*?)\1", tag, re.I | re.S)
+                    if mc:
+                        csp = html.unescape(mc.group(2))
+                        break
+        hdr_csp = h.get("content-security-policy", "")
         dirs = {p.strip().split()[0].lower(): p.strip() for p in csp.split(";") if p.strip()}
+        hdr_dirs = {p.strip().split()[0].lower(): p.strip() for p in hdr_csp.split(";") if p.strip()}
         script_src = dirs.get("script-src") or dirs.get("default-src")
-        if not csp:
+        if not csp and h.get("content-security-policy-report-only"):
+            self.add("S-CSP", "security", "low", "Content-Security-Policy is in report-only mode (not enforced)", "law", R,
+                     "Content-Security-Policy-Report-Only: " + h["content-security-policy-report-only"][:160],
+                     "Switch the policy to enforcing mode (Content-Security-Policy) once the reports are clean.")
+        elif not csp:
             self.add("S-CSP", "security", "medium", "Content-Security-Policy missing", "law", R, "Header not sent.",
                      "Add a CSP limiting which scripts can run; it also limits which third parties receive data.")
         elif not script_src:
@@ -1714,7 +1915,7 @@ class Scan:
         else:
             self.ok("S-CSP", "security", "Content-Security-Policy restricts scripts", "law", R, csp[:200])
         for bad, fid, title, basis, ref, fix in [
-                (not h.get("x-frame-options") and "frame-ancestors" not in dirs, "S-FRAME", "No clickjacking protection", "law", R,
+                (not h.get("x-frame-options") and "frame-ancestors" not in hdr_dirs, "S-FRAME", "No clickjacking protection", "law", R,
                  "Add CSP frame-ancestors 'self' or X-Frame-Options."),
                 (h.get("x-content-type-options", "").strip().lower() != "nosniff", "S-NOSNIFF", "X-Content-Type-Options missing", "law", R,
                  "Add 'X-Content-Type-Options: nosniff'."),
@@ -1747,6 +1948,30 @@ class Scan:
             self.add("S-SECTXT", "security", "low", "No security.txt file", "best", BP, "/.well-known/security.txt not found",
                      "Publish a security.txt with a security contact.")
 
+    def _uae_signals(self):
+        """Signs that the organisation serves people in the UAE (PDPL Art. 2(1)). Returns (signals, UAE page link)."""
+        d, c = self.d, self.client
+        home = d["home"].get("text", "")
+        stated = (c.get("industry", "") + " " + c.get("emirate", "")).strip()
+        host = host_of(d["final"])
+        uae_link = ""
+        already_uae = bool(UAE_PATH_RE.search(urlparse(d["final"]).path)) or \
+            bool(re.search(r"[-_]ae$", (d["home"].get("lang") or "").strip(), re.I))    # e.g. <html lang="en-AE">
+        if not already_uae:
+            for l in d["home"]["links"]:
+                u = urlparse(l["href"])
+                if site_of(u.hostname or "") == self.site and (UAE_PATH_RE.search(u.path or "") or (u.hostname or "").startswith(("ae.", "uae."))):
+                    uae_link = l["href"]
+                    break
+        hay = home + "\n" + self.ptext + "\n" + stated
+        sig = [s for s, hit in [(".ae domain", host.endswith(".ae")), ("UAE version of the site", already_uae),
+                                ("UAE regional page", bool(uae_link)),
+                                ("+971 phone number", bool(re.search(r"\+971|00971", hay))),
+                                ("UAE locations mentioned", bool(re.search(r"\b(UAE|United Arab Emirates|Dubai|Abu Dhabi|Sharjah|Ajman|Ras Al Khaimah|Fujairah|Umm Al Quwain)\b|الإمارات|دبي|أبوظبي", hay, re.I))),
+                                ("Middle East / GCC references", bool(re.search(r"Middle East|\bGCC\b|\bMENA\b|الشرق الأوسط", home, re.I))),
+                                ("AED prices", bool(re.search(r"\bAED\b|درهم", hay)))] if hit]
+        return sig, uae_link
+
     def _advisories(self, fi):
         d, c = self.d, self.client
         home = d["home"].get("text", "")
@@ -1769,24 +1994,10 @@ class Scan:
         if host.endswith(".gov.ae"):
             self.add("A-GOV", "advisory", "info", "Government website", "advisory", "PDPL Art. 2(2)(a)-(b)", host,
                      "The PDPL excludes government entities; emirate-level data laws may apply instead.")
-        uae_link = ""
-        already_uae = bool(UAE_PATH_RE.search(urlparse(d["final"]).path)) or \
-            bool(re.search(r"[-_]ae$", (d["home"].get("lang") or "").strip(), re.I))    # e.g. <html lang="en-AE">
-        if not already_uae:
-            for l in d["home"]["links"]:
-                u = urlparse(l["href"])
-                if site_of(u.hostname or "") == self.site and (UAE_PATH_RE.search(u.path or "") or (u.hostname or "").startswith(("ae.", "uae."))):
-                    uae_link = l["href"]
-                    break
+        sig, uae_link = self._uae_signals()
         if uae_link:
             self.add("A-UAEPAGE", "advisory", "info", "This website has a UAE version - scan that page for a UAE report", "advisory",
                      "PDPL Art. 2(1)", uae_link, "Re-run the scan on " + uae_link + " so the UAE privacy notice and banner are assessed.")
-        hay = home + "\n" + self.ptext + "\n" + stated
-        sig = [s for s, hit in [(".ae domain", host.endswith(".ae")), ("UAE regional page", bool(uae_link)),
-                                ("+971 phone number", bool(re.search(r"\+971|00971", hay))),
-                                ("UAE locations mentioned", bool(re.search(r"\b(UAE|United Arab Emirates|Dubai|Abu Dhabi|Sharjah|Ajman|Ras Al Khaimah|Fujairah|Umm Al Quwain)\b|الإمارات|دبي|أبوظبي", hay, re.I))),
-                                ("Middle East / GCC references", bool(re.search(r"Middle East|\bGCC\b|\bMENA\b|الشرق الأوسط", home, re.I))),
-                                ("AED prices", bool(re.search(r"\bAED\b|درهم", hay)))] if hit]
         self.add("A-SCOPE", "advisory", "info", "Link to the UAE: " + ", ".join(sig) if sig else "No link to the UAE found", "advisory",
                  "PDPL Art. 2(1) (covers organisations in the UAE and those abroad handling data of people in the UAE)",
                  ", ".join(sig) or "None found", "Confirm the PDPL applies to this client.")
@@ -1842,7 +2053,11 @@ class Scan:
                 "advisories": [asdict(f) for f in self.res if f.basis == "advisory" and not f.passed],
                 "passes": [asdict(f) for f in self.res if f.passed],
                 "trackers": sorted(rows.values(), key=lambda r: (rank[r["pre"]], r["cat"] not in NON_ESSENTIAL, r["cat"], r["vendor"])),
-                "reject_tested": bool(d.get("rejected")), "policy_url": d.get("policy", {}).get("url"),
+                "reject_tested": bool(d.get("rejected")), "accept_tested": bool(d.get("accepted")),
+                "scope_warning": "" if self._uae_signals()[0] else (
+                    "No link to the UAE was found on this website (no .ae domain, UAE address or phone number, AED prices "
+                    "or UAE pages). Confirm that the UAE PDPL applies to this organisation before sharing this report."),
+                "policy_url": d.get("policy", {}).get("url"),
                 "policy_urls": d.get("policy", {}).get("urls"), "timings": self.timings, "parallel": self.parallel,
                 "not_covered": self.na + NOT_COVERED}
 
@@ -1901,7 +2116,8 @@ def render(r, c):
          "".join("<tr><td>" + e(k) + "</td><td>" + e(v) + "</td></tr>" for k, v in details if v), "</table></div>",
          "<div><div class='big'><div class='score'>" + str(r["score"]) + "<span class='muted' style='font-size:18px'>/100</span></div>",
          "<div class='gr' style='background:" + gc + "'>Grade " + r["grade"] + "</div><div class='muted'>" + e(r["meaning"]) + "</div></div>",
-         cap, "<p class='muted'>External website scan. Not a legal opinion or a guarantee of compliance.</p></div></section>",
+         cap, ("<p style='color:#b42318;font-weight:600'>" + e(r["scope_warning"]) + "</p>") if r.get("scope_warning") else "",
+         "<p class='muted'>External website scan. Not a legal opinion or a guarantee of compliance.</p></div></section>",
          "<h2>Executive summary</h2><p>The scan found <b>" + str(n["critical"]) + " critical</b>, <b>" + str(n["high"]) + " high</b>, "
          + str(n["medium"]) + " medium and " + str(n["low"]) + " low-severity gaps on " + e(r["final_url"] or "") + ".</p>"]
     if r["cap_note"]:
@@ -1909,6 +2125,8 @@ def render(r, c):
     if r["findings"]:
         p.append("<p><b>Top priorities:</b></p><ol>" + "".join("<li><b>" + e(f["sev"].upper()) + ":</b> " + e(f["title"]) + "</li>"
                                                              for f in r["findings"][:6]) + "</ol>")
+    if r.get("scope_warning"):
+        p.append("<div class='note'><b>Scope.</b> " + e(r["scope_warning"]) + "</div>")
     p.append("<div class='note'><b>Regulatory status.</b> " + e(STATUS_NOTE) + "</div><h2>Scores by area</h2>")
     for cat in r["cats"].values():
         if cat["score"] is None:
@@ -1924,7 +2142,7 @@ def render(r, c):
     p.append("<h2>Third parties seen on the website</h2><table class='t'><tr><th>Vendor</th><th>Type</th><th>HQ</th>"
              "<th>Before consent</th><th>After Accept</th><th>After Reject</th></tr>")
     p.append("".join("<tr><td>" + e(t["vendor"]) + "</td><td>" + e(t["cat"]) + "</td><td>" + e(t["cc"]) + "</td><td>" + dot(t["pre"], t["cat"])
-                     + "</td><td>" + dot(t["acc"], t["cat"]) + "</td><td>" + (dot(t["rej"], t["cat"]) if r["reject_tested"] else "not tested")
+                     + "</td><td>" + (dot(t["acc"], t["cat"]) if r.get("accept_tested", True) else "not tested") + "</td><td>" + (dot(t["rej"], t["cat"]) if r["reject_tested"] else "not tested")
                      + "</td></tr>" for t in r["trackers"]) or "<tr><td colspan='6'>None observed</td></tr>")
     p.append("</table><p class='muted'>Tracking = data-sending calls seen. Pings (consent denied) = Google Consent Mode calls "
              "marked as denied. Script only = the vendor's code was downloaded but made no calls. Loaded = non-tracking "
@@ -1979,7 +2197,7 @@ def get_client(o, interactive):
 
 def run(client, o):
     sc = Scan(client, o)
-    print("\nScanning " + sc.url + " - this usually takes under a minute...")
+    print("\nScanning " + sc.url + " - this usually takes about a minute...")
     sc.collect()
     print("Analysing results...")
     sc.analyse()

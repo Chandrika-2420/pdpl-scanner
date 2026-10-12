@@ -125,7 +125,7 @@ animation:s 1s linear infinite;vertical-align:middle;margin-right:8px}@keyframes
 {% if view == 'home' %}
 <div class="card"><h1>UAE PDPL Website Scanner</h1>
 <div class="muted">Checks a public website against Federal Decree-Law No. 45 of 2021 and creates a client-ready PDF.
-A scan usually takes under a minute. Only scan websites you are engaged to assess.</div>
+A scan usually takes about a minute. Only scan websites you are engaged to assess.</div>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 <form method="post" action="{{ url_for('start_scan') }}">
 {% for key, label, required in fields %}
@@ -142,7 +142,7 @@ A scan usually takes under a minute. Only scan websites you are engaged to asses
 {% else %}
 <div class="card"><h1>{{ job.client.company }}</h1><div class="muted">{{ job.client.url }}</div>
 {% if job.status == 'queued' %}<p><span class="spin"></span>Waiting in the queue ({{ position }} scan(s) ahead). This page refreshes by itself.</p>
-{% elif job.status == 'running' %}<p><span class="spin"></span>Scanning... {{ elapsed }} seconds so far (usually 20-60). This page refreshes by itself.</p>
+{% elif job.status == 'running' %}<p><span class="spin"></span>Scanning... {{ elapsed }} seconds so far (usually 30-90). This page refreshes by itself.</p>
 {% elif job.status == 'failed' %}<p class="err">Scan failed: {{ job.error }}</p><a class="btn" href="{{ url_for('home') }}">Try again</a>
 {% else %}
 <p><span class="score">{{ job.score }}</span><span class="muted">/100</span><span class="grade" style="background:{{ colour }}">Grade {{ job.grade }}</span></p>
