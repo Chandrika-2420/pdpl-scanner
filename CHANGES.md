@@ -1,9 +1,10 @@
-# UAE PDPL scanner v1.4 (final): changes from the original v1.1
+# UAE PDPL scanner v1.5 (final): changes from the original v1.1
 
 Replace these five files in the repo and push: `pdpl_scanner.py`, `app.py`, `Dockerfile`, `requirements.txt` and this file. `requirements.txt` has new packages (`pypdf`, `cryptography`), so let Render rebuild the image. No environment variables are required.
 
 ## False positives fixed
 
+- **"The notice refers to the EU GDPR (8 mentions)" when the notice never says GDPR:** the count included words like "EEA". The finding now quotes the exact terms found (for example "EEA" 4 times, "EU standard contractual clauses" once). It says "written for the EU GDPR" only when the notice names the law, and "uses wording from the EU GDPR" otherwise. "UK GDPR" is no longer also counted as the EU GDPR.
 - **Transfers abroad described only for the EU/EEA marked as a pass:** a notice whose transfer wording covers only the EEA, EU or UK, with nothing about the UAE, is now a medium finding instead of a pass.
 - **"No privacy notice found":** hub pages that list several notices are now followed, and the notices are read together. The scanner also tries the site's language folder (`/en-AE/privacy`) and reads notices published as PDF files. A notice the site refuses to serve is reported as "could not be read" and is not scored; it is no longer reported as missing.
 - **Knock-on findings when no notice is found:** "No way to exercise rights" is no longer added separately, so one cause is no longer counted three times.
@@ -30,6 +31,7 @@ Replace these five files in the repo and push: `pdpl_scanner.py`, `app.py`, `Doc
 
   The scanner does not try to get around the site's bot detection.
 - **Tags that load only after the visitor scrolls or moves the mouse.** This affected Emaar, where about 20 trackers loaded after one scroll. Each session now scrolls and moves the mouse like a visitor; scrolling is not consent. A banner that closes itself on scroll is flagged.
+- **"Automated decisions" passing on portability wording:** the GDPR phrase "the processing is carried out by automated means" (a condition of the portability right) no longer counts as a statement about automated decisions.
 - **"UAE PDPL referenced" passing because a UAE address appeared near "personal data":** the notice must now name the law, the Decree-Law or the Data Office.
 - **An Arabic version reached only through a language button:** the Arabic copy of the notice (`/ar-AE/...`) is now checked.
 - **Google Analytics sent through the site's own domain** (server-side tagging) is now recognised.
@@ -41,7 +43,8 @@ Replace these five files in the repo and push: `pdpl_scanner.py`, `app.py`, `Doc
 
 - Each tracking finding shows an example of the actual call, for example `www.facebook.com/tr?ev=PageView`.
 - Quoted evidence is the exact sentence about the topic (for example the date line or the sentence about sharing), not the whole paragraph.
-- The vendor table shows "not tested" when there was no banner to click.
+- Evidence for withdrawing consent, legal basis, restriction, objection, portability and marketing opt-out quotes the sentence about that right, for example "you have a right to withdraw consent at any time", not a line from the list of when erasure applies.
+- The vendor table shows "not tested" when there was no banner to click, and "Inner pages only" for a vendor seen only on pages other than the homepage.
 
 ## Speed and stability
 

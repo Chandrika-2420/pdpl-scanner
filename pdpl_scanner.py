@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-UAE PDPL Website Scanner -> client-ready PDF report  (v1.4)
+UAE PDPL Website Scanner -> client-ready PDF report  (v1.5)
 Law   : Federal Decree-Law No. 45 of 2021 on the Protection of Personal Data (UAE PDPL)
 Run   : python pdpl_scanner.py           (asks for client details, then scans)
 Setup : pip install playwright   then   python -m playwright install chromium
@@ -22,6 +22,10 @@ v1.3  : the page is scrolled like a visitor (many sites load tags only on the fi
 v1.4  : sites that skip their tags for automated browsers (tags set up in the code but never loaded) get a
         "manual check needed" warning, consent is marked not assessed and the grade is capped, instead of a clean
         pass; transfers described only for the EU/EEA are flagged; evidence quotes the exact sentence.
+v1.5  : the foreign-law finding quotes the exact terms found and says "uses wording from" when the law itself is not
+        named; withdrawal, legal-basis and rights evidence quotes the sentence about that right, not the erasure
+        conditions; portability wording no longer passes the automated-decisions check; vendors seen only on inner
+        pages are labelled.
 Checks the presence of required wording and observable behaviour only. Not legal advice.
 """
 import argparse
@@ -322,12 +326,31 @@ UAE_REF_RE = rx(r"\bUAE PDPL\b|45 of 2021|decree[- ]law no\.? ?\(?45|uae (person
                 r"(united arab emirates|\buae\b)[^.]{0,40}\b(personal data protection|data protection) (law|legislation|regulation|decree)",
                 r"المرسوم بقانون اتحادي رقم ?\(?45|مكتب الإمارات للبيانات")
 FOREIGN_LAWS = [
-    ("India's DPDP Act", r"\bDPDP\b|Digital Personal Data Protection|Data Protection Board of India|Data Fiduciar|Data Principal"
-                         r"|Grievance Officer|Companies Act,? 2013|SPDI Rules|Information Technology Act"),
-    ("the EU GDPR", r"\bGDPR\b|General Data Protection Regulation|\bEEA\b|European Economic Area|EU standard contractual"),
+    ("India's DPDP Act", r"\bDPDP\b|Digital Personal Data Protection(?: Act)?|Data Protection Board of India|Data Fiduciar(?:y|ies)"
+                         r"|Data Principals?|Grievance Officer|Companies Act,? 2013|SPDI Rules|Information Technology Act"),
+    ("the EU GDPR", r"(?<!UK )\bGDPR\b|General Data Protection Regulation|\bEEA\b|European Economic Area|EU standard contractual(?: clauses?)?"),
     ("the UK GDPR", r"\bUK GDPR\b|Data Protection Act 2018|Information Commissioner"),
     ("US state privacy laws", r"\bCCPA\b|\bCPRA\b|California Consumer Privacy"),
     ("Saudi Arabia's PDPL", r"\bSDAIA\b|Saudi Data (and|&) (AI|Artificial Intelligence) Authority")]
+# The law's own name: when it is not in the notice, the finding says "uses wording from" instead of "is written for"
+LAW_NAME_RE = {"India's DPDP Act": r"\bDPDP\b|Digital Personal Data Protection", "the EU GDPR": r"(?<!UK )\bGDPR\b|General Data Protection Regulation",
+               "the UK GDPR": r"\bUK GDPR\b|Data Protection Act 2018", "US state privacy laws": r"\bCCPA\b|\bCPRA\b|California Consumer Privacy",
+               "Saudi Arabia's PDPL": r"\bSDAIA\b|Saudi Data (and|&) (AI|Artificial Intelligence) Authority"}
+
+
+def law_terms(pattern, text):
+    """[(term as written, count)] for each distinct term of a foreign law found in the text, most frequent first."""
+    seen = {}
+    for m in re.finditer(pattern, text, re.I):
+        t = re.sub(r"\s+", " ", m.group(0)).strip()
+        seen.setdefault(t.lower(), [t, 0])[1] += 1
+    return sorted((tuple(v) for v in seen.values()), key=lambda v: -v[1])
+
+
+def times(n):
+    return "once" if n == 1 else "twice" if n == 2 else str(n) + " times"
+
+
 PROBE = ["/privacy-policy", "/privacy", "/privacy-notice", "/legal/privacy", "/policies/privacy-policy",
          "/pages/privacy-policy", "/en/privacy-policy", "/ar/privacy-policy"]
 UAE_PATH_RE = re.compile(r"^/(ae|uae|en-ae|ar-ae|ae-en|ae-ar)(/|$)", re.I)
@@ -363,7 +386,7 @@ CHECKS = [
      [r"\bretain|retention|how long|keep (your |the )?(personal )?(data|information)|(stored|kept) for|الاحتفاظ|مدة (التخزين|الحفظ)"],
      "State retention periods or criteria, and deletion or anonymisation when the purpose ends."),
     ("N-AUTOMATED", "notice", "low", "law", "Art. 13(1)(c); Art. 18", "Automated decisions and profiling",
-     [r"automated (decision|processing|means|individual)|decisions? (based|made)[^.]{0,30}automat|profiling (of|about) you|we (do not |don't )?(use|carry out|engage in|conduct) profiling|التنميط|المعالجة الآلية"],
+     [r"automated (decision|processing|individual)|(solely|purely) (on |by )?automated|decisions? (based|made|taken)[^.]{0,30}automat|profiling (of|about) you|we (do not |don't )?(use|carry out|engage in|conduct) profiling|التنميط|المعالجة الآلية"],
      "Say whether automated decisions or profiling are used, and how to object or request human review."),
     ("N-BASIS", "notice", "medium", "law", "Art. 4; Art. 5(1)", "Legal basis (consent or an Art. 4 exception)",
      [r"legal basis|lawful basis|basis (for|of) (the |our )?processing|(based|rely|relies) on (your )?consent|with your consent|necessary (for|to) (the )?perform|الأساس القانوني|بموافقتك"],
@@ -413,7 +436,14 @@ FULL_SCOPE = {"N-UPDATED", "N-IDENTITY", "G-DPO", "N-COOKIES"}   # may sit in sh
 PREFER = {"N-RECIPIENTS": re.compile(r"\b(share|shares|shared|sharing|disclose|disclosed|disclosure|recipients?)\b|نشارك", re.I),
           "N-PURPOSE": re.compile(r"\bpurposes?\b|how we use|الأغراض", re.I),
           "N-RETENTION": re.compile(r"\b(retain|retention|store)\b|الاحتفاظ", re.I),
-          "N-BASIS": re.compile(r"legal basis|lawful basis|legitimate use|\bconsent\b|الأساس القانوني", re.I)}
+          "N-BASIS": re.compile(r"legal basis|lawful basis|legitimate use|\bconsent\b|الأساس القانوني", re.I),
+          "C-WITHDRAW-TEXT": re.compile(r"at any time|right to withdraw|(may|can) withdraw|how to withdraw|to withdraw (your )?consent|سحب", re.I),
+          "R-RESTRICT": re.compile(r"right to (restrict|object)|you (may|can|have the right to) (restrict|object)|request[^.]{0,40}restrict", re.I),
+          "R-MARKETING": re.compile(r"unsubscribe|opt[- ]?out|stop receiving|at any time|إلغاء الاشتراك", re.I),
+          "R-PORTABILITY": re.compile(r"right to (data )?portability|machine[- ]readable|transmit|another (controller|organi[sz]ation|company)", re.I)}
+# Sentences that only list when another right applies (e.g. the conditions for erasure) are poor evidence for these checks
+AVOID_RE = re.compile(r"no other (lawful|legal) (basis|ground)|overriding legitimate grounds|\b(erasure|erase|erased)\b", re.I)
+AVOID_FOR = {"C-WITHDRAW-TEXT", "N-BASIS", "R-RESTRICT", "R-MARKETING"}
 # Strong signs in the page code that a tracking tag is set up: (label, pattern, vendor names that prove it loaded)
 TAG_SIGNS = [
     ("Google Tag Manager", r"\bGTM-[A-Z0-9]{4,10}\b", ("Google Tag Manager", "Google tag loader via the site's own server")),
@@ -639,15 +669,19 @@ def ev_of(hit):
     return snip(hit[0], hit[1])
 
 
-def best_sentence(rxp, lines, extra=()):
-    """The sentence (not just the line) that matches rxp and every pattern in extra; returns (sentence, match) or None."""
+def best_sentence(rxp, lines, extra=(), avoid=None):
+    """The sentence (not just the line) that matches rxp, preferring one that also matches every pattern in extra and
+    none in avoid; returns (sentence, match) or None."""
     cands = []
     for ln in lines:
         for sn in re.split(r"(?<=[.!?;])\s+", ln):
             m = rxp.search(sn)
-            if m and all(x.search(sn) for x in extra):
-                cands.append((sn, m))
-    return max(cands, key=lambda c: (min(5, len(rxp.findall(c[0]))), min(len(c[0]), 300))) if cands else None
+            if m:
+                cands.append((sn, m, all(x.search(sn) for x in extra), not (avoid and avoid.search(sn))))
+    if not cands:
+        return None
+    best = max(cands, key=lambda c: (c[2], c[3], min(5, len(rxp.findall(c[0]))), min(len(c[0]), 300)))
+    return best[0], best[1]
 
 
 async def jseval(pg, js, default=None, timeout=20):
@@ -1788,27 +1822,29 @@ class Scan:
             self.add("N-ARABIC", "notice", "low", "No Arabic version of the privacy notice found", "best",
                      "Best practice; supports Art. 5(1)", "No Arabic notice text, Arabic page version or language link found.",
                      "Publish the privacy notice and consent banner in Arabic as well as English.")
-        laws = [(n, len(re.findall(p, full, re.I))) for n, p in FOREIGN_LAWS]
-        laws = [(n, k) for n, k in laws if k]
+        laws = [(n, law_terms(p, full)) for n, p in FOREIGN_LAWS]
+        laws = [(n, sum(c for _, c in terms), terms) for n, terms in laws if terms]
+        terms_txt = "; ".join(n + ": " + ", ".join('"' + t + '" ' + times(c) for t, c in terms[:4]) for n, _, terms in laws)
+        named = any(re.search(LAW_NAME_RE[n], full, re.I) for n, _, _ in laws)
         uae = UAE_REF_RE.search(full) or (re.search(r"\bPDPL\b", full) and re.search(r"\bUAE\b|United Arab Emirates|الإمارات", full))
         if uae:
             self.ok("N-PDPL", "notice", "UAE PDPL referenced", "best", "Best practice (localisation)", snip(full, uae))
         elif laws and not self._uae_signals()[0]:
-            names = " and ".join(n for n, _ in laws)
-            self.add("N-JURISDICTION", "advisory", "info", "Privacy notice is written for " + names + " (no link to the UAE found)",
-                     "advisory", "PDPL Art. 2(1); Art. 13", "The notice refers to " + ", ".join(n + " (" + str(k) + " mentions)" for n, k in laws) +
+            names = " and ".join(n for n, _, _ in laws)
+            self.add("N-JURISDICTION", "advisory", "info", ("Privacy notice is written for " if named else "Privacy notice uses wording from ")
+                     + names + " (no link to the UAE found)", "advisory", "PDPL Art. 2(1); Art. 13", "The notice uses terms from " + terms_txt +
                      ". No sign was found that the organisation serves people in the UAE.",
                      "If the organisation serves people in the UAE, add a UAE section under Federal Decree-Law No. 45 of 2021.")
-            self.law_note = " [Note: written for " + names + "; confirm this wording also meets the PDPL.]"
+            self.law_note = " [Note: this notice follows " + names + "; confirm this wording also meets the PDPL.]"
         elif laws:
-            names = " and ".join(n for n, _ in laws)
-            self.add("N-JURISDICTION", "notice", "high" if max(k for _, k in laws) >= 3 else "medium",
-                     "Privacy notice is written for " + names + ", not the UAE PDPL", "law", "PDPL Art. 13; Art. 5(1)",
-                     "The notice refers to " + ", ".join(n + " (" + str(k) + " mentions)" for n, k in laws) +
-                     " and never to the UAE PDPL or the UAE Data Office.",
+            names = " and ".join(n for n, _, _ in laws)
+            self.add("N-JURISDICTION", "notice", "high" if max(k for _, k, _ in laws) >= 3 else "medium",
+                     ("Privacy notice is written for " if named else "Privacy notice uses wording from ") + names + ", not the UAE PDPL",
+                     "law", "PDPL Art. 13; Art. 5(1)", "The notice uses terms from " + terms_txt +
+                     ", and never mentions the UAE PDPL or the UAE Data Office.",
                      "Publish a UAE notice (or UAE section) under Federal Decree-Law No. 45 of 2021: PDPL rights, complaints "
                      "to the UAE Data Office, Art. 22-23 transfer safeguards, and no reliance on legitimate interests.")
-            self.law_note = " [Note: written for " + names + "; confirm this wording also meets the PDPL.]"
+            self.law_note = " [Note: this notice follows " + names + "; confirm this wording also meets the PDPL.]"
         else:
             self.add("N-PDPL", "notice", "low", "UAE PDPL not referenced", "best", "Best practice (localisation)",
                      "The notice does not mention the UAE PDPL or the UAE Data Office.",
@@ -1850,7 +1886,7 @@ class Scan:
                 best = found[0]
                 if fid in PREFER:
                     extra = (PREFER[fid], PD_RE) if fid == "N-RECIPIENTS" else (PREFER[fid],)
-                    best = best_sentence(rxs[0], lines, extra) or best
+                    best = best_sentence(rxs[0], lines, extra, AVOID_RE if fid in AVOID_FOR else None) or best
                 self.ok(fid, cat, title, basis, ref, ev_of(best) + self.law_note)
                 continue
             if found:
@@ -2122,6 +2158,8 @@ class Scan:
                 r = rows.setdefault(name, {"vendor": name, "cat": v["cat"], "cc": v["cc"], "pre": "", "acc": "", "rej": ""})
                 if flag:
                     r[flag] = v["mode"]
+        for r in rows.values():                                # seen only on pages opened during the crawl, not on the homepage
+            r["inner"] = not (r["pre"] or r["acc"] or r["rej"])
         rank = {"tracking": 0, "denied": 1, "script": 2, "": 3}
         return {"score": score, "raw_score": raw, "cap_note": cap_note, "grade": grade, "meaning": meaning, "cats": cats,
                 "final_url": d.get("final"), "scanned_at": datetime.now(GST).strftime("%d %B %Y, %H:%M") + " GST (UTC+4)",
@@ -2225,13 +2263,14 @@ def render(r, c):
     p.append("<h2>Advisories (not scored)</h2>" + ("".join(card(f) for f in r["advisories"]) or "<p>None.</p>"))
     p.append("<h2>Third parties seen on the website</h2><table class='t'><tr><th>Vendor</th><th>Type</th><th>HQ</th>"
              "<th>Before consent</th><th>After Accept</th><th>After Reject</th></tr>")
-    p.append("".join("<tr><td>" + e(t["vendor"]) + "</td><td>" + e(t["cat"]) + "</td><td>" + e(t["cc"]) + "</td><td>" + dot(t["pre"], t["cat"])
+    p.append("".join("<tr><td>" + e(t["vendor"]) + "</td><td>" + e(t["cat"]) + "</td><td>" + e(t["cc"]) + "</td><td>" + (dot(t["pre"], t["cat"]) or ("Inner pages only" if t.get("inner") else ""))
                      + "</td><td>" + (dot(t["acc"], t["cat"]) if r.get("accept_tested", True) else "not tested") + "</td><td>" + (dot(t["rej"], t["cat"]) if r["reject_tested"] else "not tested")
                      + "</td></tr>" for t in r["trackers"]) or "<tr><td colspan='6'>None observed</td></tr>")
     p.append("</table><p class='muted'>Tracking = data-sending calls seen. Pings (consent denied) = Google Consent Mode calls "
              "marked as denied. Script only = the vendor's code was downloaded but made no calls. Loaded = non-tracking "
              "service (fonts, CDN, security, consent tool). Calls seen (unidentified) = a domain not in the vendor list; "
-             "see the advisory for the full address.</p>")
+             "see the advisory for the full address. Inner pages only = seen on other pages the scanner opened, not on the "
+             "homepage.</p>")
     p.append("<h2>Checks passed (" + str(len(r["passes"])) + ")</h2><ul>"
              + "".join("<li><b>" + e(f["title"]) + "</b> - " + e(f["evidence"][:220]) + "</li>" for f in r["passes"]) + "</ul>")
     p.append("<h2>Not covered by this scan</h2><ul>" + "".join("<li>" + e(x) + "</li>" for x in r["not_covered"]) + "</ul>")
